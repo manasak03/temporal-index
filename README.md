@@ -1,1 +1,1 @@
-# rolex_rag_bot
+# Rolex RAG
