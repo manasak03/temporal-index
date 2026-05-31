@@ -1,6 +1,11 @@
+from pathlib import Path
+
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
+
+SCRAPER_DIR = Path(__file__).resolve().parent
+WAITLIST_CSV = SCRAPER_DIR / "waitlist.csv"
 
 def get_response(url):
     headers = {
@@ -66,7 +71,7 @@ def main():
 
 
         # Sending over to CSV
-        df.to_csv('rolex_waitlist.csv', index=False)
+        df.to_csv(WAITLIST_CSV, index=False)
         df.info()
         return df
     
