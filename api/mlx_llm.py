@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 from api.config import MLX_MAX_TOKENS
 from api.metrics import GenerationMetrics
 from api.model_registry import ModelSpec, resolve_model
+from api.chat_history import normalize_conversation_history
 from api.prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -55,11 +58,8 @@ def _build_chat_messages(
             "content": SYSTEM_PROMPT.format(context=context or "No context retrieved."),
         },
     ]
-    for item in history or []:
-        role = item.get("role")
-        content = item.get("content")
-        if role in {"user", "assistant"} and content:
-            messages.append({"role": role, "content": content})
+    for item in normalize_conversation_history(history, query):
+        messages.append({"role": item["role"], "content": item["content"]})
     messages.append({"role": "user", "content": query})
     return messages
 
@@ -127,6 +127,68 @@ def _generate_sync(
     return answer, metrics
 
 
+def _stream_sync(
+    spec: ModelSpec,
+    query: str,
+    context: str,
+    history: list[dict[str, str]] | None,
+    *,
+    temperature: float,
+    top_p: float | None,
+    on_token: Any,
+) -> tuple[str, GenerationMetrics]:
+    from mlx_lm import stream_generate
+    from mlx_lm.sample_utils import make_sampler
+
+    path = _require_mlx_path(spec)
+    model, tokenizer = _load_model(path)
+    messages = _build_chat_messages(query, context, history)
+
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "has_chat_template", True):
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        prompt = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages) + "\n\nASSISTANT:"
+
+    kwargs: dict[str, Any] = {
+        "max_tokens": MLX_MAX_TOKENS,
+        "sampler": make_sampler(temp=temperature, top_p=top_p or 0.0),
+    }
+
+    started = time.perf_counter()
+    parts: list[str] = []
+    for response in stream_generate(model, tokenizer, prompt=prompt, **kwargs):
+        # mlx-lm yields incremental segments in response.text, not cumulative text.
+        segment = str(response.text)
+        if segment:
+            parts.append(segment)
+            on_token(segment)
+
+    answer = "".join(parts).strip()
+    if not answer:
+        raise RuntimeError("MLX model returned an empty response.")
+
+    generation_ms = int((time.perf_counter() - started) * 1000)
+    prompt_tokens = _count_tokens(tokenizer, prompt)
+    completion_tokens = _count_tokens(tokenizer, answer)
+    total_tokens = prompt_tokens + completion_tokens
+    tokens_per_second = None
+    if completion_tokens > 0 and generation_ms > 0:
+        tokens_per_second = completion_tokens / (generation_ms / 1000)
+
+    metrics = GenerationMetrics(
+        generation_ms=generation_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        tokens_per_second=tokens_per_second,
+    )
+    return answer, metrics
+
+
 class MLXLLMClient:
     """Generate chat completions with mlx-lm on Apple Silicon."""
 
@@ -176,3 +238,59 @@ class MLXLLMClient:
             temperature=temp,
             top_p=top_p,
         )
+
+    async def stream_generate_answer(
+        self,
+        query: str,
+        context: str,
+        history: list[dict[str, str]] | None = None,
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+    ) -> AsyncIterator[tuple[str, GenerationMetrics | None]]:
+        spec = resolve_model(model)
+        if not spec.is_mlx:
+            raise ValueError(f"Model `{spec.id}` is not configured for MLX.")
+
+        temp = 0.2 if temperature is None else temperature
+        queue: asyncio.Queue[tuple[str, GenerationMetrics | None] | Exception | None] = (
+            asyncio.Queue()
+        )
+        loop = asyncio.get_running_loop()
+
+        def worker() -> None:
+            try:
+
+                def on_token(delta: str) -> None:
+                    loop.call_soon_threadsafe(queue.put_nowait, (delta, None))
+
+                _, metrics = _stream_sync(
+                    spec,
+                    query,
+                    context,
+                    history,
+                    temperature=temp,
+                    top_p=top_p,
+                    on_token=on_token,
+                )
+                loop.call_soon_threadsafe(queue.put_nowait, ("", metrics))
+            except Exception as exc:  # noqa: BLE001
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            delta, maybe_metrics = item
+            if delta:
+                yield delta, None
+            if maybe_metrics is not None:
+                yield "", maybe_metrics

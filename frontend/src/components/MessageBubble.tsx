@@ -14,12 +14,20 @@ interface LoadingMeta {
 interface MessageBubbleProps {
   message: ChatMessage
   isLoading?: boolean
+  isStreaming?: boolean
   loadingMeta?: LoadingMeta
   alpha?: number
 }
 
-export function MessageBubble({ message, isLoading, loadingMeta, alpha }: MessageBubbleProps) {
+export function MessageBubble({
+  message,
+  isLoading,
+  isStreaming,
+  loadingMeta,
+  alpha,
+}: MessageBubbleProps) {
   const isUser = message.role === "user"
+  const showAssistantContent = !isUser && message.content && (isStreaming || !isLoading)
 
   return (
     <div
@@ -30,7 +38,7 @@ export function MessageBubble({ message, isLoading, loadingMeta, alpha }: Messag
     >
       <div
         className={cn(
-          "max-w-3xl text-[15px] leading-7 tracking-tight",
+          "max-w-3xl text-[15px] leading-7",
           isUser ? "text-right text-foreground/90" : "text-foreground",
         )}
       >
@@ -42,18 +50,32 @@ export function MessageBubble({ message, isLoading, loadingMeta, alpha }: Messag
           />
         )}
 
-        {!isLoading &&
-          (isUser ? (
-            <p className="whitespace-pre-wrap">{message.content}</p>
+        {isUser ? (
+          <p className="whitespace-pre-wrap">{message.content}</p>
+        ) : showAssistantContent ? (
+          isStreaming ? (
+            <p
+              className={cn(
+                "whitespace-pre-wrap font-sans",
+                message.metrics ? "mt-3" : undefined,
+              )}
+            >
+              {message.content}
+              <span
+                className="ml-0.5 inline-block h-[1.1em] w-0.5 animate-pulse bg-primary align-[-0.15em]"
+                aria-hidden
+              />
+            </p>
           ) : (
             <MarkdownMessage
               content={message.content}
               className={message.metrics ? "mt-3" : undefined}
             />
-          ))}
+          )
+        ) : null}
       </div>
 
-      {!isUser && !isLoading && message.sources && message.sources.length > 0 && (
+      {!isUser && !isLoading && !isStreaming && message.sources && message.sources.length > 0 && (
         <RetrievalInsights
           sources={message.sources}
           alpha={alpha}

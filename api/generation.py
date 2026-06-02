@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 from api.llm import LLMClient
@@ -130,3 +131,34 @@ async def generate_answer(
         top_p=top_p,
     )
     return answer, spec, metrics
+
+
+async def stream_answer(
+    query: str,
+    context: str,
+    history: list[dict[str, str]] | None = None,
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+) -> AsyncIterator[tuple[str, ModelSpec, GenerationMetrics | None]]:
+    spec = resolve_model(model)
+
+    if spec.is_mlx:
+        if not mlx_runtime_available():
+            raise RuntimeError(
+                "mlx-lm is required for MLX models. Install with: pip install mlx-lm"
+            )
+        client = get_mlx_client()
+    else:
+        client = get_ollama_client()
+
+    async for delta, metrics in client.stream_generate_answer(
+        query=query,
+        context=context,
+        history=history,
+        model=spec.id,
+        temperature=temperature,
+        top_p=top_p,
+    ):
+        yield delta, spec, metrics

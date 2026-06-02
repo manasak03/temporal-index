@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Any
 
@@ -15,7 +16,7 @@ from api.config import (
     RETRIEVAL_FUSION,
     RETRIEVAL_LIMIT,
 )
-from api.generation import generate_answer
+from api.generation import generate_answer, stream_answer
 from api.metrics import PipelineMetrics, log_pipeline_metrics
 from retrieval.hybrid import HybridSearcher
 
@@ -127,4 +128,86 @@ async def run_rag_chat(
         "model": spec.id,
         "backend": spec.backend,
         "metrics": metrics.to_dict(),
+    }
+
+
+async def run_rag_chat_stream(
+    query: str,
+    history: list[dict[str, str]] | None = None,
+    *,
+    limit: int = RETRIEVAL_LIMIT,
+    model: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    alpha: float | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    fusion_alpha = RETRIEVAL_ALPHA if alpha is None else alpha
+    started = time.perf_counter()
+    searcher = get_searcher()
+
+    retrieval_started = time.perf_counter()
+    context, sources = searcher.search(
+        query,
+        limit=limit,
+        fusion=RETRIEVAL_FUSION,  # type: ignore[arg-type]
+        alpha=fusion_alpha,
+    )
+    retrieval_ms = int((time.perf_counter() - retrieval_started) * 1000)
+    formatted_sources = format_sources(sources)
+
+    yield {
+        "type": "sources",
+        "sources": formatted_sources,
+        "retrieval_ms": retrieval_ms,
+    }
+
+    answer_parts: list[str] = []
+    spec = None
+    generation = None
+
+    async for delta, resolved_spec, metrics in stream_answer(
+        query=query,
+        context=context,
+        history=history,
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+    ):
+        spec = resolved_spec
+        if delta:
+            answer_parts.append(delta)
+            yield {"type": "token", "delta": delta}
+        if metrics is not None:
+            generation = metrics
+
+    if spec is None or generation is None:
+        raise RuntimeError("Generation stream ended without metrics.")
+
+    answer = "".join(answer_parts).strip()
+    total_ms = int((time.perf_counter() - started) * 1000)
+    pipeline_metrics = PipelineMetrics.build(
+        retrieval_ms=retrieval_ms,
+        generation=generation,
+        total_ms=total_ms,
+        chunks_retrieved=len(sources),
+        context_chars=len(context),
+        model=spec.id,
+        backend=spec.backend,
+        fusion_alpha=fusion_alpha,
+        fusion_method=RETRIEVAL_FUSION,
+    )
+    log_pipeline_metrics(
+        query,
+        pipeline_metrics,
+        history_turns=len(history or []),
+    )
+
+    yield {
+        "type": "done",
+        "answer": answer,
+        "sources": formatted_sources,
+        "latency_ms": total_ms,
+        "model": spec.id,
+        "backend": spec.backend,
+        "metrics": pipeline_metrics.to_dict(),
     }

@@ -28,7 +28,7 @@ import {
 import { MessageBubble } from "@/components/MessageBubble"
 import { PipelineStatusSheet } from "@/components/PipelineStatusSheet"
 import { SettingsDialog } from "@/components/SettingsDialog"
-import { fetchHealth, sendChatMessage } from "@/lib/api"
+import { fetchHealth, streamChatMessage } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import type {
   ChatMessage,
@@ -114,6 +114,7 @@ interface ChatMainPanelProps {
   activeSessionId: string
   messages: ChatMessage[]
   loading: boolean
+  streamingMessageId: string | null
   loadingMeta: {
     model: string
     backend: string
@@ -142,6 +143,7 @@ function ChatMainPanel({
   activeSessionId,
   messages,
   loading,
+  streamingMessageId,
   loadingMeta,
   error,
   health,
@@ -321,19 +323,20 @@ function ChatMainPanel({
 
         <ScrollArea className="min-h-0 flex-1">
           <div className="mx-auto flex w-full max-w-3xl flex-col px-3 py-4 sm:px-4 sm:py-6 md:px-8">
-            {messages.map((message) => (
-              <MessageBubble
-                key={message.id}
-                message={message}
-                isLoading={loading && message.content === "" && message.role === "assistant"}
-                loadingMeta={
-                  loading && message.content === "" && message.role === "assistant"
-                    ? (loadingMeta ?? undefined)
-                    : undefined
-                }
-                alpha={settings.alpha}
-              />
-            ))}
+            {messages.map((message) => {
+              const isActiveAssistant =
+                loading && message.id === streamingMessageId && message.role === "assistant"
+              return (
+                <MessageBubble
+                  key={message.id}
+                  message={message}
+                  isLoading={isActiveAssistant && !message.content}
+                  isStreaming={isActiveAssistant && Boolean(message.content)}
+                  loadingMeta={isActiveAssistant && !message.content ? loadingMeta ?? undefined : undefined}
+                  alpha={settings.alpha}
+                />
+              )
+            })}
             <div ref={bottomRef} />
           </div>
         </ScrollArea>
@@ -395,6 +398,7 @@ export function ChatApp() {
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settings, setSettings] = useState<GenerationSettings>(DEFAULT_GENERATION_SETTINGS)
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   const activeSession = useMemo(
@@ -491,6 +495,7 @@ export function ChatApp() {
     ])
     setInput("")
     setLoading(true)
+    setStreamingMessageId(pendingId)
     const selectedModel = modelOptions.find((option) => option.id === settings.model)
     setLoadingMeta({
       model: settings.model,
@@ -501,30 +506,52 @@ export function ChatApp() {
 
     try {
       const history = messages
+        .slice(0, -2)
         .filter((message) => message.content)
         .map((message) => ({ role: message.role, content: message.content }))
 
-      const response = await sendChatMessage({
-        query,
-        history,
-        model: settings.model,
-        temperature: settings.temperature,
-        top_p: settings.topP,
-        alpha: settings.alpha,
-      })
-
-      updateSessionMessages(sessionId, (prev) =>
-        prev.map((message) =>
-          message.id === pendingId
-            ? {
-                ...message,
-                content: response.answer,
-                sources: response.sources,
-                latencyMs: response.latency_ms,
-                metrics: response.metrics,
-              }
-            : message,
-        ),
+      await streamChatMessage(
+        {
+          query,
+          history,
+          model: settings.model,
+          temperature: settings.temperature,
+          top_p: settings.topP,
+          alpha: settings.alpha,
+        },
+        {
+          onSources: (sources) => {
+            updateSessionMessages(sessionId, (prev) =>
+              prev.map((message) =>
+                message.id === pendingId ? { ...message, sources } : message,
+              ),
+            )
+          },
+          onToken: (delta) => {
+            updateSessionMessages(sessionId, (prev) =>
+              prev.map((message) =>
+                message.id === pendingId
+                  ? { ...message, content: message.content + delta }
+                  : message,
+              ),
+            )
+          },
+          onDone: (response) => {
+            updateSessionMessages(sessionId, (prev) =>
+              prev.map((message) =>
+                message.id === pendingId
+                  ? {
+                      ...message,
+                      content: response.answer,
+                      sources: response.sources,
+                      latencyMs: response.latency_ms,
+                      metrics: response.metrics,
+                    }
+                  : message,
+              ),
+            )
+          },
+        },
       )
     } catch (err) {
       updateSessionMessages(sessionId, (prev) =>
@@ -533,6 +560,7 @@ export function ChatApp() {
       setError(err instanceof Error ? err.message : "Chat request failed.")
     } finally {
       setLoading(false)
+      setStreamingMessageId(null)
       setLoadingMeta(null)
     }
   }
@@ -546,6 +574,7 @@ export function ChatApp() {
         activeSessionId={activeSessionId}
         messages={messages}
         loading={loading}
+        streamingMessageId={streamingMessageId}
         loadingMeta={loadingMeta}
         error={error}
         health={health}

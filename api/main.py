@@ -7,12 +7,14 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.config import CORS_ORIGINS
 from api.generation import check_model_ready, llm_health_summary
 from api.model_registry import resolve_model
-from api.rag import milvus_health, run_rag_chat
+from api.rag import milvus_health, run_rag_chat, run_rag_chat_stream
+from api.sse import sse_event
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,6 +147,50 @@ async def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=500, detail=f"RAG pipeline failed: {exc}") from exc
 
     return ChatResponse(**result)
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    milvus = milvus_health()
+    if not milvus.get("collection_ready"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Milvus hybrid index is not ready. Run `python -m embedding.hybrid` "
+                f"to build `{milvus.get('collection')}`."
+            ),
+        )
+
+    spec = resolve_model(request.model)
+    model_status = await check_model_ready(spec)
+    if not model_status.get("ready"):
+        backend_hint = (
+            f"Install mlx-lm and set MLX_MODEL_PATHS for `{spec.id}`."
+            if spec.is_mlx
+            else f"Start Ollama and run `ollama pull {spec.id}`."
+        )
+        detail = model_status.get("detail") or backend_hint
+        raise HTTPException(status_code=503, detail=detail)
+
+    async def event_generator():
+        try:
+            async for event in run_rag_chat_stream(
+                query=request.query.strip(),
+                history=[message.model_dump() for message in request.history],
+                model=request.model,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                alpha=request.alpha,
+            ):
+                yield sse_event(event)
+        except Exception as exc:  # noqa: BLE001
+            yield sse_event({"type": "error", "detail": f"RAG pipeline failed: {exc}"})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 if __name__ == "__main__":
